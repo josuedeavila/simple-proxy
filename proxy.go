@@ -45,7 +45,7 @@ type HeaderRule struct {
 
 // Server represents the proxy server
 type Server struct {
-	config  Config
+	config  *Config
 	proxies map[string]*httputil.ReverseProxy
 	logger  Logger
 }
@@ -155,7 +155,7 @@ func applyDefaults(config *Config) *Config {
 }
 
 // NewServer creates a new proxy server with the given configuration
-func NewServer(config Config) *Server {
+func NewServer(config *Config) *Server {
 	s := &Server{
 		config:  config,
 		proxies: make(map[string]*httputil.ReverseProxy),
@@ -242,7 +242,7 @@ func (s *Server) SetLogger(logger Logger) {
 }
 
 // GetConfig returns the server configuration
-func (s *Server) GetConfig() Config {
+func (s *Server) GetConfig() *Config {
 	return s.config
 }
 

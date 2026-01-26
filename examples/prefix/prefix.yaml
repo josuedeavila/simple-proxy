@@ -1,7 +1,7 @@
 # Configuration example demonstrating prefix wildcard matching
 # Routes ending with /* will match any path that starts with the prefix
 server:
-  port: 8082
+  port: 8080
   timeout: 60
 
 routes:

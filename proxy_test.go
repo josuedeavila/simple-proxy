@@ -179,7 +179,7 @@ func TestServeHTTP_Proxying(t *testing.T) {
 	defer mockUpstream.Close()
 
 	// 2. Configure Proxy Server
-	config := Config{
+	config := &Config{
 		Server: ServerConfig{Port: 0, Timeout: 5},
 		Routes: []Route{
 			{
@@ -228,7 +228,7 @@ func TestServeHTTP_Proxying(t *testing.T) {
 
 // TestServeHTTP_NotFound tests 404 behavior
 func TestServeHTTP_NotFound(t *testing.T) {
-	proxyServer := NewServer(Config{})
+	proxyServer := NewServer(&Config{})
 	req := httptest.NewRequest("GET", "/unknown", nil)
 	w := httptest.NewRecorder()
 
@@ -241,7 +241,7 @@ func TestServeHTTP_NotFound(t *testing.T) {
 
 // TestServeHTTP_MethodNotAllowed tests 405 behavior
 func TestServeHTTP_MethodNotAllowed(t *testing.T) {
-	config := Config{
+	config := &Config{
 		Routes: []Route{
 			{
 				Path:    "/strict",

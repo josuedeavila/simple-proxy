@@ -1,6 +1,6 @@
 # Advanced configuration example with header manipulation
 server:
-  port: 8081
+  port: 8080
   timeout: 45
 
 routes:
