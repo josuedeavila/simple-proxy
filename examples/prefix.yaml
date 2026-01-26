@@ -1,0 +1,17 @@
+# Configuration example demonstrating prefix wildcard matching
+# Routes ending with /* will match any path that starts with the prefix
+server:
+  port: 8082
+  timeout: 60
+
+routes:
+  # Forward all requests starting with /json/ to JSONPlaceholder
+  # The prefix '/json' is stripped and the remainder is appended to the target
+  # Example: /json/posts/1 -> https://jsonplaceholder.typicode.com/posts/1
+  - path: /json/*
+    target: https://jsonplaceholder.typicode.com
+    methods:
+      - GET
+      - POST
+      - PUT
+      - DELETE

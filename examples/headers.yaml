@@ -1,0 +1,24 @@
+# Advanced configuration example with header manipulation
+server:
+  port: 8081
+  timeout: 45
+
+routes:
+  - path: /api/echo
+    target: https://postman-echo.com/get
+    methods:
+      - GET
+    # Add static headers to the upstream request
+    add_headers:
+      X-Proxy-By: "Simple-Proxy"
+      X-Environment: "Development"
+    # Transform headers into query parameters
+    header_rules:
+      # Take X-User-ID header, add it as ?user_id=... and remove the original header
+      - from_header: "X-User-ID"
+        to_query: "user_id"
+        remove: true
+      # Take X-API-Key header, add it as ?apikey=... but keep the original header
+      - from_header: "X-API-Key"
+        to_query: "apikey"
+        remove: false

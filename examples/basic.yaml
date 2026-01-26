@@ -1,0 +1,10 @@
+# Basic configuration example
+server:
+  port: 8080
+  timeout: 30
+
+routes:
+  - path: /api/v1/posts
+    target: https://jsonplaceholder.typicode.com/posts
+    methods:
+      - GET
