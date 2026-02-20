@@ -43,11 +43,16 @@ type HeaderRule struct {
 	Remove     bool   `yaml:"remove"` // Remove header after transformation
 }
 
+// Middleware defines a function to process request
+type Middleware func(http.Handler) http.Handler
+
 // Server represents the proxy server
 type Server struct {
-	config  *Config
-	proxies map[string]*httputil.ReverseProxy
-	logger  Logger
+	config       *Config
+	proxies      map[string]*httputil.ReverseProxy
+	logger       Logger
+	middlewares  []Middleware
+	finalHandler http.Handler
 }
 
 // Logger interface for custom logging
@@ -157,9 +162,10 @@ func applyDefaults(config *Config) *Config {
 // NewServer creates a new proxy server with the given configuration
 func NewServer(config *Config) *Server {
 	s := &Server{
-		config:  config,
-		proxies: make(map[string]*httputil.ReverseProxy),
-		logger:  &nopLogger{},
+		config:      config,
+		proxies:     make(map[string]*httputil.ReverseProxy),
+		logger:      &nopLogger{},
+		middlewares: []Middleware{},
 	}
 
 	// Create reverse proxies for each route
@@ -195,6 +201,7 @@ func NewServer(config *Config) *Server {
 		s.proxies[route.Path] = proxy
 	}
 
+	s.rebuildHandler()
 	return s
 }
 
@@ -218,6 +225,7 @@ func (s *Server) customizeRequest(req *http.Request, route *Route, targetURL *ur
 
 			// Remove header if specified
 			if rule.Remove {
+
 				req.Header.Del(rule.FromHeader)
 			}
 		}
@@ -241,13 +249,38 @@ func (s *Server) SetLogger(logger Logger) {
 	s.logger = logger
 }
 
+// Use adds middleware to the server
+func (s *Server) Use(mw ...Middleware) {
+	s.middlewares = append(s.middlewares, mw...)
+	s.rebuildHandler()
+}
+
+// rebuildHandler constructs the final handler chain
+func (s *Server) rebuildHandler() {
+	var handler http.Handler = http.HandlerFunc(s.handleRequest)
+
+	// Apply middlewares in reverse order
+	for i := len(s.middlewares) - 1; i >= 0; i-- {
+		handler = s.middlewares[i](handler)
+	}
+	s.finalHandler = handler
+}
+
 // GetConfig returns the server configuration
 func (s *Server) GetConfig() *Config {
 	return s.config
 }
 
-// ServeHTTP implements http.Handler
+// ServeHTTP implements http.Handler and delegates to the final handler chain
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.finalHandler == nil {
+		s.rebuildHandler()
+	}
+	s.finalHandler.ServeHTTP(w, r)
+}
+
+// handleRequest performs the actual proxying logic
+func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Find matching route
 	route := s.findRoute(r)
 	if route == nil {
