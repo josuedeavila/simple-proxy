@@ -34,6 +34,7 @@ type Route struct {
 	Methods     []string          `yaml:"methods"`
 	HeaderRules []HeaderRule      `yaml:"header_rules"`
 	AddHeaders  map[string]string `yaml:"add_headers"`
+	RequiredHeaders []string         `yaml:"required_headers"`
 }
 
 // HeaderRule defines how to transform a header
@@ -292,6 +293,15 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if len(route.Methods) > 0 && !s.methodAllowed(r.Method, route.Methods) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+
+	// Check required headers
+	for _, header := range route.RequiredHeaders {
+		if r.Header.Get(header) == "" {
+			s.logger.Printf("Missing required header: %s", header)
+			http.Error(w, fmt.Sprintf("Missing required header: %s", header), http.StatusBadRequest)
+			return
+		}
 	}
 
 	// Get the proxy for this route and forward

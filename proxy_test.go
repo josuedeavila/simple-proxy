@@ -261,3 +261,70 @@ func TestServeHTTP_MethodNotAllowed(t *testing.T) {
 		t.Errorf("Expected 405, got %d", w.Result().StatusCode)
 	}
 }
+
+// TestServeHTTP_RequiredHeaders tests handling of RequiredHeaders route config
+func TestServeHTTP_RequiredHeaders(t *testing.T) {
+	config := &Config{
+		Routes: []Route{
+			{
+				Path:    "/protected",
+				Target:  "http://example.com",
+				RequiredHeaders: []string{"X-Company-ID", "X-Integration-ID"},
+			},
+		},
+	}
+	proxyServer := NewServer(config)
+
+	// Create a mock upstream server to test a successful 200 OK request
+	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer mockUpstream.Close()
+	
+	config.Routes[0].Target = mockUpstream.URL
+
+	proxyServer = NewServer(config)
+
+	tests := []struct {
+		name           string
+		headers        map[string]string
+		expectedStatus int
+	}{
+		{
+			name: "All required headers present",
+			headers: map[string]string{
+				"X-Company-ID":     "123",
+				"X-Integration-ID": "456",
+			},
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name: "Missing one required header",
+			headers: map[string]string{
+				"X-Company-ID": "123",
+			},
+			expectedStatus: http.StatusBadRequest,
+		},
+		{
+			name:           "Missing all required headers",
+			headers:        map[string]string{},
+			expectedStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/protected", nil)
+			for k, v := range tt.headers {
+				req.Header.Set(k, v)
+			}
+			w := httptest.NewRecorder()
+
+			proxyServer.ServeHTTP(w, req)
+
+			if w.Result().StatusCode != tt.expectedStatus {
+				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.Result().StatusCode)
+			}
+		})
+	}
+}

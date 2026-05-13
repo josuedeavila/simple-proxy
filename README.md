@@ -7,6 +7,7 @@ A configurable HTTP proxy server written in Go with YAML-based routing.
 - **Flexible Routing**: Supports exact path matching and prefix/wildcard routing.
 - **Header Manipulation**: Add custom headers, remove headers, or transform headers into query parameters.
 - **Method Filtering**: Restrict routes to specific HTTP methods.
+- **Header Validation**: Require specific headers to be present before routing.
 - **Configurable**: Simple YAML configuration for server settings and routes.
 
 ## Getting Started
@@ -60,14 +61,16 @@ routes:
     # Request to /api/users/1 -> https://api.backend.com/users/1
 ```
 
-#### Header Rules
+#### Header Validation & Rules
 
-Transform headers before they reach the target:
+Require specific headers to be present before routing, and transform headers before they reach the target:
 
 ```yaml
 routes:
   - path: /secure
     target: https://secure.backend.com
+    required_headers:
+      - "X-Company-ID"
     header_rules:
       - from_header: "X-API-Key"
         to_query: "apikey"
