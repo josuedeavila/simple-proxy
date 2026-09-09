@@ -2,6 +2,8 @@
 package proxy
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -9,7 +11,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -29,12 +34,12 @@ type ServerConfig struct {
 
 // Route represents a proxy route configuration
 type Route struct {
-	Path        string            `yaml:"path"`
-	Target      string            `yaml:"target"`
-	Methods     []string          `yaml:"methods"`
-	HeaderRules []HeaderRule      `yaml:"header_rules"`
-	AddHeaders  map[string]string `yaml:"add_headers"`
-	RequiredHeaders []string         `yaml:"required_headers"`
+	Path            string            `yaml:"path"`
+	Target          string            `yaml:"target"`
+	Methods         []string          `yaml:"methods"`
+	HeaderRules     []HeaderRule      `yaml:"header_rules"`
+	AddHeaders      map[string]string `yaml:"add_headers"`
+	RequiredHeaders []string          `yaml:"required_headers"`
 }
 
 // HeaderRule defines how to transform a header
@@ -47,105 +52,124 @@ type HeaderRule struct {
 // Middleware defines a function to process request
 type Middleware func(http.Handler) http.Handler
 
-// Server represents the proxy server
-type Server struct {
-	config       *Config
-	proxies      map[string]*httputil.ReverseProxy
-	logger       Logger
-	middlewares  []Middleware
-	finalHandler http.Handler
-}
-
 // Logger interface for custom logging
 type Logger interface {
 	Printf(format string, v ...any)
 }
 
+// DefaultLogger forwards proxy activity to the standard library logger.
+type DefaultLogger struct{}
+
+// Printf implements Logger.
+func (DefaultLogger) Printf(format string, v ...any) { log.Printf(format, v...) }
+
 type nopLogger struct{}
 
-func (n *nopLogger) Printf(format string, v ...any) {}
+func (nopLogger) Printf(string, ...any) {}
 
-// LoadConfigFromDir loads all YAML files from a directory
+// routeEntry pairs a configured route with the reverse proxy that serves it.
+type routeEntry struct {
+	route *Route
+	proxy *httputil.ReverseProxy
+}
+
+// Server represents the proxy server
+type Server struct {
+	config     *Config
+	routes     []routeEntry
+	httpServer *http.Server
+
+	mu          sync.Mutex // guards middlewares
+	middlewares []Middleware
+
+	logger  atomic.Pointer[Logger]
+	handler atomic.Pointer[http.Handler]
+}
+
+// LoadConfigFromDir loads every YAML file in a directory, in lexical order.
+// Routes are concatenated; server settings come from the first file that
+// defines them. Any unreadable or invalid file is reported as an error.
 func LoadConfigFromDir(dir string) (*Config, error) {
-	var configs []*Config
-
-	files, err := filepath.Glob(filepath.Join(dir, "*.yaml"))
+	files, err := yamlFiles(dir)
 	if err != nil {
 		return nil, err
 	}
-
-	ymlFiles, err := filepath.Glob(filepath.Join(dir, "*.yml"))
-	if err != nil {
-		return nil, err
-	}
-	files = append(files, ymlFiles...)
-
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no YAML files found in directory: %s", dir)
+		return nil, fmt.Errorf("proxy: no YAML files found in directory: %s", dir)
 	}
 
+	configs := make([]*Config, 0, len(files))
 	for _, file := range files {
-		data, err := os.ReadFile(file)
+		config, err := loadFile(file)
 		if err != nil {
-			log.Printf("warning: failed to read %s: %v", file, err)
-			continue
+			return nil, fmt.Errorf("proxy: %s: %w", file, err)
 		}
-
-		var config Config
-		if err := yaml.Unmarshal(data, &config); err != nil {
-			log.Printf("warning: failed to parse %s: %v", file, err)
-			continue
-		}
-
-		configs = append(configs, &config)
-		log.Printf("loaded config from: %s", file)
-	}
-
-	if len(configs) == 0 {
-		return nil, fmt.Errorf("no valid configuration files found")
+		configs = append(configs, config)
 	}
 
 	return mergeConfigs(configs), nil
 }
 
+// yamlFiles returns the .yaml and .yml files in dir, sorted by name.
+func yamlFiles(dir string) ([]string, error) {
+	var files []string
+	for _, pattern := range []string{"*.yaml", "*.yml"} {
+		matches, err := filepath.Glob(filepath.Join(dir, pattern))
+		if err != nil {
+			return nil, err
+		}
+		files = append(files, matches...)
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
 // LoadConfigFromFile loads a single YAML file
 func LoadConfigFromFile(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	config, err := loadFile(path)
 	if err != nil {
 		return nil, err
 	}
-
-	var config Config
-	if err := yaml.Unmarshal(data, &config); err != nil {
-		return nil, err
-	}
-
-	return applyDefaults(&config), nil
+	return applyDefaults(config), nil
 }
 
 // LoadConfigFromBytes loads configuration from byte slice
 func LoadConfigFromBytes(data []byte) (*Config, error) {
+	config, err := parseConfig(data)
+	if err != nil {
+		return nil, err
+	}
+	return applyDefaults(config), nil
+}
+
+func loadFile(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return parseConfig(data)
+}
+
+func parseConfig(data []byte) (*Config, error) {
 	var config Config
 	if err := yaml.Unmarshal(data, &config); err != nil {
 		return nil, err
 	}
-
-	return applyDefaults(&config), nil
+	return &config, nil
 }
 
-// mergeConfigs combines multiple configs into one
+// mergeConfigs combines multiple configs into one without mutating its inputs.
 func mergeConfigs(configs []*Config) *Config {
-	if len(configs) == 0 {
-		return nil
+	merged := &Config{}
+	for _, config := range configs {
+		if merged.Server.Port == 0 {
+			merged.Server.Port = config.Server.Port
+		}
+		if merged.Server.Timeout == 0 {
+			merged.Server.Timeout = config.Server.Timeout
+		}
+		merged.Routes = append(merged.Routes, config.Routes...)
 	}
-
-	merged := configs[0]
-
-	// Append routes from other configs
-	for i := 1; i < len(configs); i++ {
-		merged.Routes = append(merged.Routes, configs[i].Routes...)
-	}
-
 	return applyDefaults(merged)
 }
 
@@ -160,103 +184,180 @@ func applyDefaults(config *Config) *Config {
 	return config
 }
 
-// NewServer creates a new proxy server with the given configuration
-func NewServer(config *Config) *Server {
-	s := &Server{
-		config:      config,
-		proxies:     make(map[string]*httputil.ReverseProxy),
-		logger:      &nopLogger{},
-		middlewares: []Middleware{},
+// NewServer creates a new proxy server with the given configuration.
+// It fails if any route is missing a path or points at an unusable target,
+// so a broken route is reported at startup rather than as a 500 at runtime.
+func NewServer(config *Config) (*Server, error) {
+	if config == nil {
+		return nil, errors.New("proxy: config must not be nil")
 	}
+	applyDefaults(config)
 
-	// Create reverse proxies for each route
+	s := &Server{config: config}
+	s.SetLogger(nil)
+
+	timeout := time.Duration(config.Server.Timeout) * time.Second
+	transport := newTransport(timeout)
+
 	for i := range config.Routes {
-		route := &config.Routes[i]
-		targetURL, err := url.Parse(route.Target)
+		entry, err := s.newRouteEntry(&config.Routes[i], transport)
 		if err != nil {
-			log.Printf("warning: invalid target URL for route %s: %v", route.Path, err)
-			continue
+			return nil, err
 		}
+		s.routes = append(s.routes, entry)
+	}
+	sortRoutes(s.routes)
 
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-		// Customize the Director to handle header rules and path rewriting
-		originalDirector := proxy.Director
-		proxy.Director = func(req *http.Request) {
-			originalPath := req.URL.Path
-			originalDirector(req)
-			s.customizeRequest(req, route, targetURL, originalPath)
-		}
-
-		// Set timeout on the transport
-		proxy.Transport = &http.Transport{
-			ResponseHeaderTimeout: time.Duration(config.Server.Timeout) * time.Second,
-		}
-
-		// Custom error handler
-		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-			s.logger.Printf("proxy error for %s: %v", r.URL.Path, err)
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
-		}
-
-		s.proxies[route.Path] = proxy
+	s.httpServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", config.Server.Port),
+		Handler: s,
+		// ReadTimeout and WriteTimeout are deliberately left unset: a proxy
+		// must be able to stream large uploads and downloads. ReadHeaderTimeout
+		// is what closes slow-header (Slowloris) connections.
+		ReadHeaderTimeout: timeout,
+		IdleTimeout:       2 * timeout,
 	}
 
 	s.rebuildHandler()
-	return s
+	return s, nil
 }
 
-// customizeRequest modifies the request according to route rules
-func (s *Server) customizeRequest(req *http.Request, route *Route, targetURL *url.URL, originalPath string) {
-	// Handle path rewriting for wildcard routes
-	if strings.HasSuffix(route.Path, "/*") {
-		prefix := strings.TrimSuffix(route.Path, "/*")
-		remainingPath := strings.TrimPrefix(originalPath, prefix)
-		req.URL.Path = targetURL.Path + remainingPath
-	} else {
-		req.URL.Path = targetURL.Path
+// newTransport clones the standard transport so routes keep connection
+// pooling, dial timeouts, HTTP/2 and proxy-from-environment support.
+func newTransport(timeout time.Duration) *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = timeout
+	return transport
+}
+
+// newRouteEntry builds the reverse proxy that serves a single route.
+func (s *Server) newRouteEntry(route *Route, transport http.RoundTripper) (routeEntry, error) {
+	if route.Path == "" {
+		return routeEntry{}, errors.New("proxy: route with empty path")
 	}
 
-	// Process query parameters from header rules
-	query := req.URL.Query()
-	for _, rule := range route.HeaderRules {
-		if headerValue := req.Header.Get(rule.FromHeader); headerValue != "" {
-			query.Set(rule.ToQuery, headerValue)
-			s.logger.Printf("Transformed %s: %s -> query param %s", rule.FromHeader, headerValue, rule.ToQuery)
+	target, err := url.Parse(route.Target)
+	if err != nil {
+		return routeEntry{}, fmt.Errorf("proxy: route %s: invalid target %q: %w", route.Path, route.Target, err)
+	}
+	if target.Scheme == "" || target.Host == "" {
+		return routeEntry{}, fmt.Errorf("proxy: route %s: target %q must include scheme and host", route.Path, route.Target)
+	}
 
-			// Remove header if specified
-			if rule.Remove {
-
-				req.Header.Del(rule.FromHeader)
+	proxy := &httputil.ReverseProxy{
+		Transport: transport,
+		Director: func(req *http.Request) {
+			req.URL.Scheme = target.Scheme
+			req.URL.Host = target.Host
+			req.Host = target.Host
+			s.customizeRequest(req, route, target)
+			if _, ok := req.Header["User-Agent"]; !ok {
+				req.Header.Set("User-Agent", "")
 			}
-		}
+		},
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			s.log().Printf("proxy error for %s: %v", r.URL.Path, err)
+			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+		},
 	}
-	req.URL.RawQuery = query.Encode()
 
-	// Add custom headers
+	return routeEntry{route: route, proxy: proxy}, nil
+}
+
+// sortRoutes orders routes from most to least specific, so that an exact path
+// is never shadowed by a wildcard and the longest wildcard prefix wins.
+// Routes of equal specificity keep their configuration order.
+func sortRoutes(routes []routeEntry) {
+	sort.SliceStable(routes, func(i, j int) bool {
+		a, b := routes[i].route.Path, routes[j].route.Path
+		if isWildcard(a) != isWildcard(b) {
+			return !isWildcard(a)
+		}
+		return len(a) > len(b)
+	})
+}
+
+func isWildcard(routePath string) bool { return strings.HasSuffix(routePath, "/*") }
+
+// customizeRequest modifies the request according to route rules
+func (s *Server) customizeRequest(req *http.Request, route *Route, target *url.URL) {
+	req.URL.Path = rewritePath(req.URL.Path, route.Path, target.Path)
+	req.URL.RawPath = ""
+
+	s.applyHeaderRules(req, route)
+
 	for key, value := range route.AddHeaders {
 		req.Header.Set(key, value)
 	}
-
-	// Set the Host header to match the target
-	req.Host = targetURL.Host
 }
 
-// SetLogger sets a custom logger
+// rewritePath maps an incoming path onto the target. A wildcard route strips
+// its prefix and appends the remainder to the target path; an exact route
+// always maps to the target path.
+func rewritePath(requestPath, routePath, targetPath string) string {
+	if !isWildcard(routePath) {
+		return orRoot(targetPath)
+	}
+
+	prefix := strings.TrimSuffix(routePath, "/*")
+	rest := strings.TrimPrefix(requestPath, prefix)
+	if rest == "" {
+		return orRoot(targetPath)
+	}
+	return strings.TrimSuffix(targetPath, "/") + rest
+}
+
+func orRoot(path string) string {
+	if path == "" {
+		return "/"
+	}
+	return path
+}
+
+// applyHeaderRules copies configured headers into the target query string.
+// Header values are never logged: they are commonly credentials.
+func (s *Server) applyHeaderRules(req *http.Request, route *Route) {
+	if len(route.HeaderRules) == 0 {
+		return
+	}
+
+	query := req.URL.Query()
+	for _, rule := range route.HeaderRules {
+		value := req.Header.Get(rule.FromHeader)
+		if value == "" {
+			continue
+		}
+		query.Set(rule.ToQuery, value)
+		if rule.Remove {
+			req.Header.Del(rule.FromHeader)
+		}
+		s.log().Printf("transformed header %s into query param %s", rule.FromHeader, rule.ToQuery)
+	}
+	req.URL.RawQuery = query.Encode()
+}
+
+// SetLogger sets a custom logger. A nil logger disables logging.
+// It is safe to call while the server is running.
 func (s *Server) SetLogger(logger Logger) {
 	if logger == nil {
-		logger = &nopLogger{}
+		logger = nopLogger{}
 	}
-	s.logger = logger
+	s.logger.Store(&logger)
 }
 
-// Use adds middleware to the server
+func (s *Server) log() Logger { return *s.logger.Load() }
+
+// Use adds middleware to the server, outermost first. It is safe to call while
+// the server is running; in-flight requests keep the chain they started with.
 func (s *Server) Use(mw ...Middleware) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.middlewares = append(s.middlewares, mw...)
 	s.rebuildHandler()
 }
 
-// rebuildHandler constructs the final handler chain
+// rebuildHandler constructs the final handler chain. Callers must hold s.mu,
+// except in NewServer where the server is not yet shared.
 func (s *Server) rebuildHandler() {
 	var handler http.Handler = http.HandlerFunc(s.handleRequest)
 
@@ -264,110 +365,124 @@ func (s *Server) rebuildHandler() {
 	for i := len(s.middlewares) - 1; i >= 0; i-- {
 		handler = s.middlewares[i](handler)
 	}
-	s.finalHandler = handler
+	s.handler.Store(&handler)
 }
 
-// GetConfig returns the server configuration
-func (s *Server) GetConfig() *Config {
-	return s.config
+// Config returns the server configuration. The routes slice is copied, but the
+// maps and slices inside each route are shared with the server.
+func (s *Server) Config() Config {
+	config := *s.config
+	config.Routes = append([]Route(nil), s.config.Routes...)
+	return config
 }
 
 // ServeHTTP implements http.Handler and delegates to the final handler chain
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if s.finalHandler == nil {
-		s.rebuildHandler()
-	}
-	s.finalHandler.ServeHTTP(w, r)
+	(*s.handler.Load()).ServeHTTP(w, r)
 }
 
 // handleRequest performs the actual proxying logic
 func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Find matching route
-	route := s.findRoute(r)
-	if route == nil {
+	entry := s.findRoute(r.URL.Path)
+	if entry == nil {
 		http.NotFound(w, r)
 		return
 	}
+	route := entry.route
 
-	// Check method
-	if len(route.Methods) > 0 && !s.methodAllowed(r.Method, route.Methods) {
+	if len(route.Methods) > 0 && !methodAllowed(r.Method, route.Methods) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Check required headers
-	for _, header := range route.RequiredHeaders {
-		if r.Header.Get(header) == "" {
-			s.logger.Printf("Missing required header: %s", header)
-			http.Error(w, fmt.Sprintf("Missing required header: %s", header), http.StatusBadRequest)
-			return
-		}
-	}
-
-	// Get the proxy for this route and forward
-	proxy := s.proxies[route.Path]
-	if proxy == nil {
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	if missing := missingHeader(r, route.RequiredHeaders); missing != "" {
+		s.log().Printf("missing required header %s for %s", missing, r.URL.Path)
+		http.Error(w, "Missing required header: "+missing, http.StatusBadRequest)
 		return
 	}
 
-	s.logger.Printf("%s %s -> %s", r.Method, r.URL.Path, route.Target)
-	proxy.ServeHTTP(w, r)
+	s.log().Printf("%s %s -> %s", r.Method, r.URL.Path, route.Target)
+	entry.proxy.ServeHTTP(w, r)
 }
 
-// Start starts the proxy server
+// Start starts the proxy server and blocks until it stops.
+// It returns nil after a graceful Shutdown.
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%d", s.config.Server.Port)
-	s.logger.Printf("Proxy server starting on %s", addr)
-	s.logger.Printf("Loaded %d routes", len(s.config.Routes))
-	for _, route := range s.config.Routes {
-		s.logger.Printf("  %s -> %s (methods: %v)", route.Path, route.Target, route.Methods)
-	}
-
-	return http.ListenAndServe(addr, s)
+	s.logStartup("")
+	return ignoreServerClosed(s.httpServer.ListenAndServe())
 }
 
-// StartTLS starts the proxy server with TLS
+// StartTLS starts the proxy server with TLS and blocks until it stops.
+// It returns nil after a graceful Shutdown.
 func (s *Server) StartTLS(certFile, keyFile string) error {
-	addr := fmt.Sprintf(":%d", s.config.Server.Port)
-	s.logger.Printf("Proxy server starting on %s (TLS)", addr)
-	s.logger.Printf("Loaded %d routes", len(s.config.Routes))
-
-	return http.ListenAndServeTLS(addr, certFile, keyFile, s)
+	s.logStartup(" (TLS)")
+	return ignoreServerClosed(s.httpServer.ListenAndServeTLS(certFile, keyFile))
 }
 
-// findRoute finds the matching route for a request
-func (s *Server) findRoute(r *http.Request) *Route {
-	for i := range s.config.Routes {
-		route := &s.config.Routes[i]
-		if s.pathMatches(r.URL.Path, route.Path) {
-			return route
+// Shutdown gracefully shuts the server down without interrupting active
+// requests, and makes Start return.
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.httpServer.Shutdown(ctx)
+}
+
+func ignoreServerClosed(err error) error {
+	if errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *Server) logStartup(suffix string) {
+	logger := s.log()
+	logger.Printf("proxy server starting on %s%s", s.httpServer.Addr, suffix)
+	logger.Printf("loaded %d routes", len(s.routes))
+	for i := range s.routes {
+		route := s.routes[i].route
+		logger.Printf("  %s -> %s (methods: %v)", route.Path, route.Target, route.Methods)
+	}
+}
+
+// findRoute returns the most specific route matching the request path.
+func (s *Server) findRoute(requestPath string) *routeEntry {
+	for i := range s.routes {
+		if pathMatches(requestPath, s.routes[i].route.Path) {
+			return &s.routes[i]
 		}
 	}
 	return nil
 }
 
-// pathMatches checks if a request path matches a route path
-func (s *Server) pathMatches(requestPath, routePath string) bool {
+// pathMatches reports whether a request path matches a route path. A wildcard
+// route matches its prefix and everything below it, but not a longer path
+// segment that merely starts with the same characters.
+func pathMatches(requestPath, routePath string) bool {
 	if requestPath == routePath {
 		return true
 	}
-
-	// Prefix match (if route path ends with /*)
-	if strings.HasSuffix(routePath, "/*") {
-		prefix := strings.TrimSuffix(routePath, "/*")
-		return strings.HasPrefix(requestPath, prefix)
+	if !isWildcard(routePath) {
+		return false
 	}
 
-	return false
+	prefix := strings.TrimSuffix(routePath, "/*")
+	return requestPath == prefix || strings.HasPrefix(requestPath, prefix+"/")
 }
 
 // methodAllowed checks if the HTTP method is allowed
-func (s *Server) methodAllowed(method string, allowed []string) bool {
+func methodAllowed(method string, allowed []string) bool {
 	for _, m := range allowed {
 		if strings.EqualFold(m, method) {
 			return true
 		}
 	}
 	return false
+}
+
+// missingHeader returns the first required header absent from the request.
+func missingHeader(r *http.Request, required []string) string {
+	for _, header := range required {
+		if r.Header.Get(header) == "" {
+			return header
+		}
+	}
+	return ""
 }

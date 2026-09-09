@@ -57,7 +57,10 @@ func main() {
 	}
 
 	// Create server
-	server := proxy.NewServer(config)
+	server, err := proxy.NewServer(config)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
 
 	// Set a basic logger for the proxy internals
 	server.SetLogger(&StdoutLogger{})
