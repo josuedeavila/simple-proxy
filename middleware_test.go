@@ -13,7 +13,7 @@ func TestMiddleware_Execution(t *testing.T) {
 			{Path: "/test", Target: "http://example.com"},
 		},
 	}
-	server := NewServer(config)
+	server := mustServer(t, config)
 
 	executed := false
 	mw := func(next http.Handler) http.Handler {
@@ -41,7 +41,7 @@ func TestMiddleware_Order(t *testing.T) {
 			{Path: "/test", Target: "http://example.com"},
 		},
 	}
-	server := NewServer(config)
+	server := mustServer(t, config)
 
 	var executionOrder []string
 
@@ -88,7 +88,7 @@ func TestMiddleware_Modification(t *testing.T) {
 			{Path: "/test", Target: "http://example.com"},
 		},
 	}
-	server := NewServer(config)
+	server := mustServer(t, config)
 
 	mw := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -115,7 +115,7 @@ func TestMiddleware_ShortCircuit(t *testing.T) {
 			{Path: "/test", Target: "http://example.com"},
 		},
 	}
-	server := NewServer(config)
+	server := mustServer(t, config)
 
 	mw := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

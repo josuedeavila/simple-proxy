@@ -16,10 +16,13 @@ func New(configData []byte) {
 	}
 
 	// Create and start the server
-	server := proxy.NewServer(config)
+	server, err := proxy.NewServer(config)
+	if err != nil {
+		log.Fatalf("Failed to create server: %v", err)
+	}
 
 	// Enable standard logging for this example
-	server.SetLogger(nil)
+	server.SetLogger(proxy.DefaultLogger{})
 
 	if err := server.Start(); err != nil {
 		log.Fatalf("Server stopped with error: %v", err)

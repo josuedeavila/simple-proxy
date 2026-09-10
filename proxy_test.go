@@ -1,330 +1,547 @@
 package proxy
 
 import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
-
-// TestLoadConfigFromBytes tests loading configuration from a byte slice
-func TestLoadConfigFromBytes(t *testing.T) {
-	yamlData := []byte(`
-server:
-  port: 9090
-  timeout: 60
-routes:
-  - path: /test
-    target: http://example.com
-    methods: [GET]
-`)
-
-	config, err := LoadConfigFromBytes(yamlData)
-	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
-	}
-
-	if config.Server.Port != 9090 {
-		t.Errorf("Expected port 9090, got %d", config.Server.Port)
-	}
-	if config.Server.Timeout != 60 {
-		t.Errorf("Expected timeout 60, got %d", config.Server.Timeout)
-	}
-	if len(config.Routes) != 1 {
-		t.Errorf("Expected 1 route, got %d", len(config.Routes))
-	}
-	if config.Routes[0].Path != "/test" {
-		t.Errorf("Expected route path /test, got %s", config.Routes[0].Path)
-	}
-}
-
-// TestApplyDefaults tests if default values are applied correctly
-func TestApplyDefaults(t *testing.T) {
-	yamlData := []byte(`
-routes:
-  - path: /test
-    target: http://example.com
-`)
-
-	config, err := LoadConfigFromBytes(yamlData)
-	if err != nil {
-		t.Fatalf("Failed to load config: %v", err)
-	}
-
-	if config.Server.Port != 8000 {
-		t.Errorf("Expected default port 8000, got %d", config.Server.Port)
-	}
-	if config.Server.Timeout != 30 {
-		t.Errorf("Expected default timeout 30, got %d", config.Server.Timeout)
-	}
-}
-
-// TestLoadConfigFromDir tests loading configuration from a directory
-func TestLoadConfigFromDir(t *testing.T) {
-	// Create a temporary directory
-	dir, err := os.MkdirTemp("", "proxy_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-
-	// Create first config file
-	config1 := []byte(`
-server:
-  port: 9091
-routes:
-  - path: /route1
-    target: http://target1.com
-`)
-	if err := os.WriteFile(filepath.Join(dir, "config1.yaml"), config1, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create second config file
-	config2 := []byte(`
-routes:
-  - path: /route2
-    target: http://target2.com
-`)
-	if err := os.WriteFile(filepath.Join(dir, "config2.yml"), config2, 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	config, err := LoadConfigFromDir(dir)
-	if err != nil {
-		t.Fatalf("Failed to load config from dir: %v", err)
-	}
-
-	if config.Server.Port != 9091 {
-		t.Errorf("Expected port 9091, got %d", config.Server.Port)
-	}
-	if len(config.Routes) != 2 {
-		t.Errorf("Expected 2 routes, got %d", len(config.Routes))
-	}
-}
 
 // TestPathMatches tests the logic for route matching
 func TestPathMatches(t *testing.T) {
-	server := &Server{}
-
 	tests := []struct {
+		name        string
 		requestPath string
 		routePath   string
-		expected    bool
+		want        bool
 	}{
-		{"/exact", "/exact", true},
-		{"/exact/extra", "/exact", false},
-		{"/prefix/resource", "/prefix/*", true},
-		{"/prefix", "/prefix/*", true},
-		{"/other", "/exact", false},
+		{"exact match", "/exact", "/exact", true},
+		{"exact route ignores subpaths", "/exact/extra", "/exact", false},
+		{"unrelated path", "/other", "/exact", false},
+		{"wildcard matches child", "/prefix/resource", "/prefix/*", true},
+		{"wildcard matches deep child", "/prefix/a/b/c", "/prefix/*", true},
+		{"wildcard matches bare prefix", "/prefix", "/prefix/*", true},
+		{"wildcard matches prefix with slash", "/prefix/", "/prefix/*", true},
+		{"wildcard does not match longer segment", "/prefixfoo", "/prefix/*", false},
+		{"wildcard does not match sibling", "/prefix-other/a", "/prefix/*", false},
+		{"root wildcard matches everything", "/anything", "/*", true},
 	}
 
 	for _, tt := range tests {
-		result := server.pathMatches(tt.requestPath, tt.routePath)
-		if result != tt.expected {
-			t.Errorf("pathMatches(%q, %q) = %v, expected %v", tt.requestPath, tt.routePath, result, tt.expected)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			if got := pathMatches(tt.requestPath, tt.routePath); got != tt.want {
+				t.Errorf("pathMatches(%q, %q) = %v, want %v", tt.requestPath, tt.routePath, got, tt.want)
+			}
+		})
 	}
 }
 
 // TestMethodAllowed tests the HTTP method checking logic
 func TestMethodAllowed(t *testing.T) {
-	server := &Server{}
-	allowed := []string{"GET", "POST"}
+	tests := []struct {
+		name    string
+		method  string
+		allowed []string
+		want    bool
+	}{
+		{"listed method", "GET", []string{"GET", "POST"}, true},
+		{"case insensitive", "post", []string{"GET", "POST"}, true},
+		{"unlisted method", "DELETE", []string{"GET", "POST"}, false},
+		{"empty allow list", "GET", nil, false},
+	}
 
-	if !server.methodAllowed("GET", allowed) {
-		t.Error("GET should be allowed")
-	}
-	if !server.methodAllowed("post", allowed) { // Case insensitive
-		t.Error("post should be allowed")
-	}
-	if server.methodAllowed("DELETE", allowed) {
-		t.Error("DELETE should not be allowed")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := methodAllowed(tt.method, tt.allowed); got != tt.want {
+				t.Errorf("methodAllowed(%q, %v) = %v, want %v", tt.method, tt.allowed, got, tt.want)
+			}
+		})
 	}
 }
 
-// TestServeHTTP_Proxying tests the full proxying flow including modifications
-func TestServeHTTP_Proxying(t *testing.T) {
-	// 1. Create a mock upstream server
-	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify modifications
+// TestRewritePath tests how request paths are mapped onto the target
+func TestRewritePath(t *testing.T) {
+	tests := []struct {
+		name        string
+		requestPath string
+		routePath   string
+		targetPath  string
+		want        string
+	}{
+		{"exact route with target path", "/svc", "/svc", "/upstream", "/upstream"},
+		{"exact route without target path", "/svc", "/svc", "", "/"},
+		{"wildcard appends remainder", "/api/users/1", "/api/*", "/upstream", "/upstream/users/1"},
+		{"wildcard onto bare target", "/api/users/1", "/api/*", "", "/users/1"},
+		{"wildcard on bare prefix", "/api", "/api/*", "/upstream", "/upstream"},
+		{"wildcard strips trailing slash on target", "/api/users", "/api/*", "/upstream/", "/upstream/users"},
+		{"root wildcard", "/a/b", "/*", "/base", "/base/a/b"},
+	}
 
-		// Check Path
-		if r.URL.Path != "/upstream/resource" {
-			t.Errorf("Upstream received path %s, expected /upstream/resource", r.URL.Path)
-		}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := rewritePath(tt.requestPath, tt.routePath, tt.targetPath)
+			if got != tt.want {
+				t.Errorf("rewritePath(%q, %q, %q) = %q, want %q",
+					tt.requestPath, tt.routePath, tt.targetPath, got, tt.want)
+			}
+		})
+	}
+}
 
-		// Check Query Param Transformation (From X-User-ID header)
-		if q := r.URL.Query().Get("user"); q != "123" {
-			t.Errorf("Expected query param user=123, got %s", q)
-		}
-
-		// Check Header Removal
-		if r.Header.Get("X-User-ID") != "" {
-			t.Error("Expected X-User-ID header to be removed")
-		}
-
-		// Check Added Header
-		if r.Header.Get("X-Proxy-Add") != "added" {
-			t.Errorf("Expected X-Proxy-Add header 'added', got %s", r.Header.Get("X-Proxy-Add"))
-		}
-
-		// Send response
-		w.Header().Set("X-Upstream-Response", "ok")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("response from upstream"))
-	}))
-	defer mockUpstream.Close()
-
-	// 2. Configure Proxy Server
-	config := &Config{
-		Server: ServerConfig{Port: 0, Timeout: 5},
+// TestFindRoute_Specificity verifies that a wildcard never shadows a more
+// specific route, whatever order the routes appear in the configuration.
+func TestFindRoute_Specificity(t *testing.T) {
+	server := mustServer(t, &Config{
 		Routes: []Route{
-			{
-				Path:    "/api/*",
-				Target:  mockUpstream.URL + "/upstream",
-				Methods: []string{"GET"},
-				AddHeaders: map[string]string{
-					"X-Proxy-Add": "added",
-				},
-				HeaderRules: []HeaderRule{
-					{
-						FromHeader: "X-User-ID",
-						ToQuery:    "user",
-						Remove:     true,
-					},
-				},
-			},
+			{Path: "/api/*", Target: "http://wildcard.example.com"},
+			{Path: "/api/users", Target: "http://users.example.com"},
+			{Path: "/api/users/*", Target: "http://users-tree.example.com"},
 		},
-	}
-
-	proxyServer := NewServer(config)
-
-	// 3. Create Request to Proxy
-	req := httptest.NewRequest("GET", "/api/resource", nil)
-	req.Header.Set("X-User-ID", "123")
-	w := httptest.NewRecorder()
-
-	// 4. Serve
-	proxyServer.ServeHTTP(w, req)
-
-	// 5. Check Proxy Response
-	resp := w.Result()
-	if resp.StatusCode != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode)
-	}
-
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "response from upstream" {
-		t.Errorf("Expected body 'response from upstream', got %s", string(body))
-	}
-
-	if resp.Header.Get("X-Upstream-Response") != "ok" {
-		t.Error("Expected X-Upstream-Response header")
-	}
-}
-
-// TestServeHTTP_NotFound tests 404 behavior
-func TestServeHTTP_NotFound(t *testing.T) {
-	proxyServer := NewServer(&Config{})
-	req := httptest.NewRequest("GET", "/unknown", nil)
-	w := httptest.NewRecorder()
-
-	proxyServer.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusNotFound {
-		t.Errorf("Expected 404, got %d", w.Result().StatusCode)
-	}
-}
-
-// TestServeHTTP_MethodNotAllowed tests 405 behavior
-func TestServeHTTP_MethodNotAllowed(t *testing.T) {
-	config := &Config{
-		Routes: []Route{
-			{
-				Path:    "/strict",
-				Target:  "http://example.com",
-				Methods: []string{"POST"},
-			},
-		},
-	}
-	proxyServer := NewServer(config)
-
-	req := httptest.NewRequest("GET", "/strict", nil)
-	w := httptest.NewRecorder()
-
-	proxyServer.ServeHTTP(w, req)
-
-	if w.Result().StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("Expected 405, got %d", w.Result().StatusCode)
-	}
-}
-
-// TestServeHTTP_RequiredHeaders tests handling of RequiredHeaders route config
-func TestServeHTTP_RequiredHeaders(t *testing.T) {
-	config := &Config{
-		Routes: []Route{
-			{
-				Path:    "/protected",
-				Target:  "http://example.com",
-				RequiredHeaders: []string{"X-Company-ID", "X-Integration-ID"},
-			},
-		},
-	}
-	proxyServer := NewServer(config)
-
-	// Create a mock upstream server to test a successful 200 OK request
-	mockUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer mockUpstream.Close()
-	
-	config.Routes[0].Target = mockUpstream.URL
-
-	proxyServer = NewServer(config)
+	})
 
 	tests := []struct {
-		name           string
-		headers        map[string]string
-		expectedStatus int
+		name        string
+		requestPath string
+		want        string
 	}{
+		{"exact route beats wildcard", "/api/users", "/api/users"},
+		{"longest wildcard wins", "/api/users/42", "/api/users/*"},
+		{"shorter wildcard still reachable", "/api/orders", "/api/*"},
+		{"no partial-segment match", "/apifoo", ""},
+		{"unmatched path", "/other", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := server.findRoute(tt.requestPath)
+			got := ""
+			if entry != nil {
+				got = entry.route.Path
+			}
+			if got != tt.want {
+				t.Errorf("findRoute(%q) = %q, want %q", tt.requestPath, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestNewServer_Errors verifies that broken routes fail at startup rather than
+// turning into a 500 on the first request.
+func TestNewServer_Errors(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  *Config
+		wantMsg string
+	}{
+		{name: "nil config", config: nil, wantMsg: "must not be nil"},
 		{
-			name: "All required headers present",
-			headers: map[string]string{
-				"X-Company-ID":     "123",
-				"X-Integration-ID": "456",
-			},
-			expectedStatus: http.StatusOK,
+			name:    "empty path",
+			config:  &Config{Routes: []Route{{Path: "", Target: "http://example.com"}}},
+			wantMsg: "empty path",
 		},
 		{
-			name: "Missing one required header",
-			headers: map[string]string{
-				"X-Company-ID": "123",
-			},
-			expectedStatus: http.StatusBadRequest,
+			name:    "unparsable target",
+			config:  &Config{Routes: []Route{{Path: "/a", Target: "http://[::1]:namedport"}}},
+			wantMsg: "invalid target",
 		},
 		{
-			name:           "Missing all required headers",
-			headers:        map[string]string{},
-			expectedStatus: http.StatusBadRequest,
+			name:    "target without scheme",
+			config:  &Config{Routes: []Route{{Path: "/a", Target: "example.com"}}},
+			wantMsg: "must include scheme and host",
+		},
+		{
+			name:    "empty target",
+			config:  &Config{Routes: []Route{{Path: "/a", Target: ""}}},
+			wantMsg: "must include scheme and host",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			req := httptest.NewRequest("GET", "/protected", nil)
+			_, err := NewServer(tt.config)
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestServeHTTP_Proxying tests the full proxying flow including modifications
+func TestServeHTTP_Proxying(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/upstream/resource" {
+			t.Errorf("upstream path = %s, want /upstream/resource", r.URL.Path)
+		}
+		if q := r.URL.Query().Get("user"); q != "123" {
+			t.Errorf("query param user = %s, want 123", q)
+		}
+		if r.Header.Get("X-User-ID") != "" {
+			t.Error("expected X-User-ID header to be removed")
+		}
+		if got := r.Header.Get("X-Proxy-Add"); got != "added" {
+			t.Errorf("X-Proxy-Add = %s, want added", got)
+		}
+
+		w.Header().Set("X-Upstream-Response", "ok")
+		w.Write([]byte("response from upstream"))
+	}))
+	defer upstream.Close()
+
+	server := mustServer(t, &Config{
+		Server: ServerConfig{Timeout: 5},
+		Routes: []Route{
+			{
+				Path:       "/api/*",
+				Target:     upstream.URL + "/upstream",
+				Methods:    []string{"GET"},
+				AddHeaders: map[string]string{"X-Proxy-Add": "added"},
+				HeaderRules: []HeaderRule{
+					{FromHeader: "X-User-ID", ToQuery: "user", Remove: true},
+				},
+			},
+		},
+	})
+
+	req := httptest.NewRequest("GET", "/api/resource", nil)
+	req.Header.Set("X-User-ID", "123")
+	w := httptest.NewRecorder()
+
+	server.ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "response from upstream" {
+		t.Errorf("body = %q, want %q", body, "response from upstream")
+	}
+	if resp.Header.Get("X-Upstream-Response") != "ok" {
+		t.Error("expected X-Upstream-Response header to be forwarded")
+	}
+}
+
+// TestServeHTTP_PreservesQueryString verifies that a request query survives
+// proxying when the route defines no header rules.
+func TestServeHTTP_PreservesQueryString(t *testing.T) {
+	var gotQuery string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+	}))
+	defer upstream.Close()
+
+	server := mustServer(t, &Config{
+		Routes: []Route{{Path: "/api/*", Target: upstream.URL}},
+	})
+
+	req := httptest.NewRequest("GET", "/api/search?q=hello&page=2", nil)
+	server.ServeHTTP(httptest.NewRecorder(), req)
+
+	if gotQuery != "q=hello&page=2" {
+		t.Errorf("upstream query = %q, want %q", gotQuery, "q=hello&page=2")
+	}
+}
+
+// TestServeHTTP_Rejections covers the request checks performed before proxying
+func TestServeHTTP_Rejections(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer upstream.Close()
+
+	server := mustServer(t, &Config{
+		Routes: []Route{
+			{Path: "/strict", Target: upstream.URL, Methods: []string{"POST"}},
+			{
+				Path:            "/protected",
+				Target:          upstream.URL,
+				RequiredHeaders: []string{"X-Company-ID", "X-Integration-ID"},
+			},
+		},
+	})
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		headers    map[string]string
+		wantStatus int
+	}{
+		{
+			name:       "unknown route",
+			method:     "GET",
+			path:       "/unknown",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "method not allowed",
+			method:     "GET",
+			path:       "/strict",
+			wantStatus: http.StatusMethodNotAllowed,
+		},
+		{
+			name:       "allowed method",
+			method:     "POST",
+			path:       "/strict",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:   "all required headers present",
+			method: "GET",
+			path:   "/protected",
+			headers: map[string]string{
+				"X-Company-ID":     "123",
+				"X-Integration-ID": "456",
+			},
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "missing one required header",
+			method:     "GET",
+			path:       "/protected",
+			headers:    map[string]string{"X-Company-ID": "123"},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "missing all required headers",
+			method:     "GET",
+			path:       "/protected",
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest(tt.method, tt.path, nil)
 			for k, v := range tt.headers {
 				req.Header.Set(k, v)
 			}
 			w := httptest.NewRecorder()
 
-			proxyServer.ServeHTTP(w, req)
+			server.ServeHTTP(w, req)
 
-			if w.Result().StatusCode != tt.expectedStatus {
-				t.Errorf("Expected status %d, got %d", tt.expectedStatus, w.Result().StatusCode)
+			if got := w.Result().StatusCode; got != tt.wantStatus {
+				t.Errorf("status = %d, want %d", got, tt.wantStatus)
 			}
 		})
 	}
+}
+
+// TestServeHTTP_BadGateway verifies the error handler when the upstream is down
+func TestServeHTTP_BadGateway(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	target := upstream.URL
+	upstream.Close() // nothing is listening on target any more
+
+	server := mustServer(t, &Config{
+		Server: ServerConfig{Timeout: 2},
+		Routes: []Route{{Path: "/down", Target: target}},
+	})
+
+	w := httptest.NewRecorder()
+	server.ServeHTTP(w, httptest.NewRequest("GET", "/down", nil))
+
+	if got := w.Result().StatusCode; got != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502", got)
+	}
+}
+
+// TestConfig verifies that the accessor hands back a copy of the routes
+func TestConfig(t *testing.T) {
+	server := mustServer(t, &Config{
+		Server: ServerConfig{Port: 1234, Timeout: 7},
+		Routes: []Route{{Path: "/a", Target: "http://a.example.com"}},
+	})
+
+	config := server.Config()
+	if config.Server.Port != 1234 || config.Server.Timeout != 7 {
+		t.Errorf("server config = %+v, want port 1234 and timeout 7", config.Server)
+	}
+
+	config.Routes[0].Path = "/mutated"
+	if server.Config().Routes[0].Path != "/a" {
+		t.Error("mutating the returned routes changed the server configuration")
+	}
+}
+
+// TestStartAndShutdown exercises the real listener and the graceful stop path
+func TestStartAndShutdown(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("hello"))
+	}))
+	defer upstream.Close()
+
+	port := freePort(t)
+	server := mustServer(t, &Config{
+		Server: ServerConfig{Port: port, Timeout: 5},
+		Routes: []Route{{Path: "/api/*", Target: upstream.URL}},
+	})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.Start() }()
+
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/thing", port)
+	body := waitForOK(t, http.DefaultClient, url)
+	if body != "hello" {
+		t.Errorf("body = %q, want %q", body, "hello")
+	}
+
+	shutdownAndWait(t, server, errCh)
+}
+
+// TestStartTLS exercises the TLS listener with a self-signed certificate
+func TestStartTLS(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte("secure"))
+	}))
+	defer upstream.Close()
+
+	certFile, keyFile, pool := selfSignedCert(t)
+
+	port := freePort(t)
+	server := mustServer(t, &Config{
+		Server: ServerConfig{Port: port, Timeout: 5},
+		Routes: []Route{{Path: "/api/*", Target: upstream.URL}},
+	})
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- server.StartTLS(certFile, keyFile) }()
+
+	client := &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool}},
+	}
+	url := fmt.Sprintf("https://localhost:%d/api/thing", port)
+	if body := waitForOK(t, client, url); body != "secure" {
+		t.Errorf("body = %q, want %q", body, "secure")
+	}
+
+	shutdownAndWait(t, server, errCh)
+}
+
+func mustServer(t *testing.T, config *Config) *Server {
+	t.Helper()
+	server, err := NewServer(config)
+	if err != nil {
+		t.Fatalf("NewServer() error = %v", err)
+	}
+	return server
+}
+
+// freePort reserves a port and releases it for the server under test to bind.
+func freePort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	return listener.Addr().(*net.TCPAddr).Port
+}
+
+// waitForOK polls url until the server under test is listening, then returns
+// the response body.
+func waitForOK(t *testing.T, client *http.Client, url string) string {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		resp, err := client.Get(url)
+		if err == nil {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d, want 200", resp.StatusCode)
+			}
+			body, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(body)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("server never became reachable: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func shutdownAndWait(t *testing.T, server *Server, errCh <-chan error) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		t.Fatalf("Shutdown() error = %v", err)
+	}
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Errorf("Start() error = %v, want nil after a graceful shutdown", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start() did not return after Shutdown()")
+	}
+}
+
+// selfSignedCert writes a throwaway certificate for the TLS test and returns
+// the file paths plus a pool that trusts it.
+func selfSignedCert(t *testing.T) (certFile, keyFile string, pool *x509.CertPool) {
+	t.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	template := x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "localhost"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
+	}
+
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+
+	dir := t.TempDir()
+	certFile = filepath.Join(dir, "cert.pem")
+	keyFile = filepath.Join(dir, "key.pem")
+	writeFile(t, certFile, string(certPEM))
+	writeFile(t, keyFile, string(keyPEM))
+
+	pool = x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("failed to add the test certificate to the pool")
+	}
+	return certFile, keyFile, pool
 }

@@ -14,7 +14,7 @@ A configurable HTTP proxy server written in Go with YAML-based routing.
 
 ### Prerequisites
 
-- Go 1.21 or higher
+- Go 1.26 or higher
 
 ### Installation
 
@@ -27,8 +27,11 @@ go get github.com/josuedeavila/simple-proxy
 You can run the proxy server by providing a configuration file. An example runner is included in the project:
 
 ```bash
-go run examples/run_proxy.go -config examples/basic.yaml
+go run ./examples/basic
 ```
+
+Each directory under `examples/` embeds its own YAML file: `basic`, `prefix`,
+`headers` and `middleware`.
 
 ## Configuration
 
@@ -53,6 +56,11 @@ routes:
 #### Wildcards
 
 Use `/*` to match all paths under a prefix. The prefix is stripped and appended to the target.
+A wildcard only matches whole path segments, so `/api/*` matches `/api` and `/api/users` but not `/apifoo`.
+
+Routes are matched from most to least specific: an exact path always wins over a
+wildcard, and the longest wildcard prefix wins over a shorter one, regardless of
+the order they appear in the configuration.
 
 ```yaml
 routes:
@@ -86,6 +94,7 @@ package main
 
 import (
 	"log"
+
 	proxy "github.com/josuedeavila/simple-proxy"
 )
 
@@ -96,18 +105,45 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Create server
-	server := proxy.NewServer(*config)
+	// Create server. This fails if a route has no path or an unusable target,
+	// so a broken configuration is caught here instead of at request time.
+	server, err := proxy.NewServer(config)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Enable logging (silent by default)
-	server.SetLogger(&proxy.DefaultLogger{})
+	server.SetLogger(proxy.DefaultLogger{})
 
-	// Start server
+	// Start server. Start blocks and returns nil after a graceful Shutdown.
 	if err := server.Start(); err != nil {
 		log.Fatal(err)
 	}
 }
 ```
+
+### Middleware
+
+`Use` wraps the proxy with standard `func(http.Handler) http.Handler` middleware,
+outermost first:
+
+```go
+server.Use(LoggingMiddleware, AuthMiddleware)
+```
+
+### Graceful shutdown
+
+```go
+ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+defer cancel()
+
+if err := server.Shutdown(ctx); err != nil {
+	log.Print(err)
+}
+```
+
+`Shutdown` stops accepting new connections, waits for in-flight requests, and
+makes `Start` return `nil`.
 
 ## License
 
