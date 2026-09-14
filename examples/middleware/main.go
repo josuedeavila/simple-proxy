@@ -7,6 +7,7 @@ import (
 	"time"
 
 	proxy "github.com/josuedeavila/simple-proxy"
+	"github.com/josuedeavila/simple-proxy/examples"
 )
 
 //go:embed middleware.yaml
@@ -49,9 +50,16 @@ func AuthMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// Run with the embedded yaml:
+//
+//	go run ./examples/middleware
+//
+// Or with the JSON configuration read from the environment:
+//
+//	PROXY_CONFIG="$(cat examples/middleware/middleware.json)" go run ./examples/middleware
 func main() {
-	// Load configuration
-	config, err := proxy.LoadConfigFromBytes(configData)
+	// Load configuration from PROXY_CONFIG when set, otherwise from the yaml
+	config, err := examples.LoadConfig(configData)
 	if err != nil {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}

@@ -1,0 +1,29 @@
+{
+  "server": {
+    "port": 8080,
+    "timeout": 45
+  },
+  "routes": [
+    {
+      "path": "/api/echo",
+      "target": "https://postman-echo.com/get",
+      "methods": ["GET"],
+      "add_headers": {
+        "X-Proxy-By": "Simple-Proxy",
+        "X-Environment": "Development"
+      },
+      "header_rules": [
+        {
+          "from_header": "X-User-ID",
+          "to_query": "user_id",
+          "remove": true
+        },
+        {
+          "from_header": "X-API-Key",
+          "to_query": "apikey",
+          "remove": false
+        }
+      ]
+    }
+  ]
+}
