@@ -3,6 +3,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -22,31 +23,31 @@ import (
 
 // Config represents the main configuration
 type Config struct {
-	Server ServerConfig `yaml:"server"`
-	Routes []Route      `yaml:"routes"`
+	Server ServerConfig `yaml:"server" json:"server"`
+	Routes []Route      `yaml:"routes" json:"routes"`
 }
 
 // ServerConfig contains server settings
 type ServerConfig struct {
-	Port    int `yaml:"port"`
-	Timeout int `yaml:"timeout"` // in seconds
+	Port    int `yaml:"port" json:"port"`
+	Timeout int `yaml:"timeout" json:"timeout"` // in seconds
 }
 
 // Route represents a proxy route configuration
 type Route struct {
-	Path            string            `yaml:"path"`
-	Target          string            `yaml:"target"`
-	Methods         []string          `yaml:"methods"`
-	HeaderRules     []HeaderRule      `yaml:"header_rules"`
-	AddHeaders      map[string]string `yaml:"add_headers"`
-	RequiredHeaders []string          `yaml:"required_headers"`
+	Path            string            `yaml:"path" json:"path"`
+	Target          string            `yaml:"target" json:"target"`
+	Methods         []string          `yaml:"methods" json:"methods"`
+	HeaderRules     []HeaderRule      `yaml:"header_rules" json:"header_rules"`
+	AddHeaders      map[string]string `yaml:"add_headers" json:"add_headers"`
+	RequiredHeaders []string          `yaml:"required_headers" json:"required_headers"`
 }
 
 // HeaderRule defines how to transform a header
 type HeaderRule struct {
-	FromHeader string `yaml:"from_header"`
-	ToQuery    string `yaml:"to_query"`
-	Remove     bool   `yaml:"remove"` // Remove header after transformation
+	FromHeader string `yaml:"from_header" json:"from_header"`
+	ToQuery    string `yaml:"to_query" json:"to_query"`
+	Remove     bool   `yaml:"remove" json:"remove"` // Remove header after transformation
 }
 
 // Middleware defines a function to process request
@@ -140,6 +141,38 @@ func LoadConfigFromBytes(data []byte) (*Config, error) {
 		return nil, err
 	}
 	return applyDefaults(config), nil
+}
+
+// LoadConfigFromJSONString loads configuration from a JSON string.
+func LoadConfigFromJSONString(data string) (*Config, error) {
+	if strings.TrimSpace(data) == "" {
+		return nil, errors.New("proxy: empty JSON configuration")
+	}
+
+	var config Config
+	if err := json.Unmarshal([]byte(data), &config); err != nil {
+		return nil, fmt.Errorf("proxy: invalid JSON configuration: %w", err)
+	}
+	return applyDefaults(&config), nil
+}
+
+// LoadConfigFromEnv loads configuration from a JSON string held by the named
+// environment variable, which must be set and non-empty.
+func LoadConfigFromEnv(name string) (*Config, error) {
+	if name == "" {
+		return nil, errors.New("proxy: environment variable name must not be empty")
+	}
+
+	value, ok := os.LookupEnv(name)
+	if !ok || strings.TrimSpace(value) == "" {
+		return nil, fmt.Errorf("proxy: environment variable %s is not set or empty", name)
+	}
+
+	config, err := LoadConfigFromJSONString(value)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", name, err)
+	}
+	return config, nil
 }
 
 func loadFile(path string) (*Config, error) {

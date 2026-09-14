@@ -122,6 +122,28 @@ func main() {
 }
 ```
 
+### Loading the configuration
+
+| Function                         | Source                                           |
+| -------------------------------- | ------------------------------------------------ |
+| `LoadConfigFromFile(path)`       | a single YAML file                               |
+| `LoadConfigFromDir(dir)`         | every `.yaml`/`.yml` file in a directory, merged |
+| `LoadConfigFromBytes(data)`      | YAML held in memory                              |
+| `LoadConfigFromJSONString(data)` | JSON held in a string                            |
+| `LoadConfigFromEnv(name)`        | JSON held in the named environment variable      |
+
+The JSON and YAML documents use the same keys, so either format describes the
+same configuration.
+
+```go
+config, err := proxy.LoadConfigFromEnv("PROXY_CONFIG")
+```
+
+```bash
+PROXY_CONFIG='{"server":{"port":8080},"routes":[{"path":"/api/*","target":"https://jsonplaceholder.typicode.com"}]}' \
+	go run ./examples/basic
+```
+
 ### Middleware
 
 `Use` wraps the proxy with standard `func(http.Handler) http.Handler` middleware,

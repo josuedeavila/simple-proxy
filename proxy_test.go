@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -180,6 +181,170 @@ func TestNewServer_Errors(t *testing.T) {
 				t.Errorf("error = %q, want it to mention %q", err, tt.wantMsg)
 			}
 		})
+	}
+}
+
+const jsonConfig = `{
+  "server": {"port": 9090, "timeout": 15},
+  "routes": [
+    {
+      "path": "/api/*",
+      "target": "http://api.example.com",
+      "methods": ["GET", "POST"],
+      "header_rules": [{"from_header": "X-User-ID", "to_query": "user", "remove": true}],
+      "add_headers": {"X-Proxy": "simple-proxy"},
+      "required_headers": ["X-Company-ID"]
+    }
+  ]
+}`
+
+// TestLoadConfigFromJSONString covers parsing a configuration held as JSON
+func TestLoadConfigFromJSONString(t *testing.T) {
+	t.Run("full configuration", func(t *testing.T) {
+		config, err := LoadConfigFromJSONString(jsonConfig)
+		if err != nil {
+			t.Fatalf("LoadConfigFromJSONString() error = %v", err)
+		}
+
+		want := &Config{
+			Server: ServerConfig{Port: 9090, Timeout: 15},
+			Routes: []Route{{
+				Path:            "/api/*",
+				Target:          "http://api.example.com",
+				Methods:         []string{"GET", "POST"},
+				HeaderRules:     []HeaderRule{{FromHeader: "X-User-ID", ToQuery: "user", Remove: true}},
+				AddHeaders:      map[string]string{"X-Proxy": "simple-proxy"},
+				RequiredHeaders: []string{"X-Company-ID"},
+			}},
+		}
+		if !reflect.DeepEqual(config, want) {
+			t.Errorf("config = %+v, want %+v", config, want)
+		}
+	})
+
+	t.Run("defaults applied", func(t *testing.T) {
+		config, err := LoadConfigFromJSONString(`{"routes": [{"path": "/a", "target": "http://a.example.com"}]}`)
+		if err != nil {
+			t.Fatalf("LoadConfigFromJSONString() error = %v", err)
+		}
+		if config.Server.Port != 8000 || config.Server.Timeout != 30 {
+			t.Errorf("server config = %+v, want port 8000 and timeout 30", config.Server)
+		}
+	})
+
+	errorTests := []struct {
+		name    string
+		data    string
+		wantMsg string
+	}{
+		{"empty string", "", "empty JSON configuration"},
+		{"blank string", "   \n\t ", "empty JSON configuration"},
+		{"malformed JSON", `{"server": {`, "invalid JSON configuration"},
+		{"wrong type", `{"server": {"port": "8080"}}`, "invalid JSON configuration"},
+	}
+
+	for _, tt := range errorTests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadConfigFromJSONString(tt.data)
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantMsg) {
+				t.Errorf("error = %q, want it to mention %q", err, tt.wantMsg)
+			}
+		})
+	}
+}
+
+// TestLoadConfigFromEnv covers reading the JSON configuration from the environment
+func TestLoadConfigFromEnv(t *testing.T) {
+	t.Run("valid environment variable", func(t *testing.T) {
+		t.Setenv("PROXY_CONFIG", jsonConfig)
+
+		config, err := LoadConfigFromEnv("PROXY_CONFIG")
+		if err != nil {
+			t.Fatalf("LoadConfigFromEnv() error = %v", err)
+		}
+
+		want, err := LoadConfigFromJSONString(jsonConfig)
+		if err != nil {
+			t.Fatalf("LoadConfigFromJSONString() error = %v", err)
+		}
+		if !reflect.DeepEqual(config, want) {
+			t.Errorf("config = %+v, want %+v", config, want)
+		}
+	})
+
+	t.Run("empty variable name", func(t *testing.T) {
+		_, err := LoadConfigFromEnv("")
+		if err == nil || !strings.Contains(err.Error(), "must not be empty") {
+			t.Errorf("error = %v, want it to mention an empty variable name", err)
+		}
+	})
+
+	t.Run("variable set but empty", func(t *testing.T) {
+		t.Setenv("PROXY_CONFIG", "  ")
+
+		_, err := LoadConfigFromEnv("PROXY_CONFIG")
+		if err == nil || !strings.Contains(err.Error(), "is not set or empty") {
+			t.Errorf("error = %v, want it to mention an unset or empty variable", err)
+		}
+	})
+
+	t.Run("variable not set", func(t *testing.T) {
+		_, err := LoadConfigFromEnv("PROXY_CONFIG_UNSET_FOR_TEST")
+		if err == nil || !strings.Contains(err.Error(), "is not set or empty") {
+			t.Errorf("error = %v, want it to mention an unset or empty variable", err)
+		}
+	})
+
+	t.Run("invalid JSON", func(t *testing.T) {
+		t.Setenv("PROXY_CONFIG", "{")
+
+		_, err := LoadConfigFromEnv("PROXY_CONFIG")
+		if err == nil {
+			t.Fatal("expected an error, got nil")
+		}
+		if !strings.Contains(err.Error(), "PROXY_CONFIG") || !strings.Contains(err.Error(), "invalid JSON configuration") {
+			t.Errorf("error = %q, want it to name the variable and the JSON failure", err)
+		}
+	})
+}
+
+// TestLoadConfig_JSONAndYAMLEquivalence verifies that the dual struct tags make
+// both formats describe the same configuration.
+func TestLoadConfig_JSONAndYAMLEquivalence(t *testing.T) {
+	yamlConfig := `
+server:
+  port: 9090
+  timeout: 15
+routes:
+  - path: /api/*
+    target: http://api.example.com
+    methods:
+      - GET
+      - POST
+    header_rules:
+      - from_header: X-User-ID
+        to_query: user
+        remove: true
+    add_headers:
+      X-Proxy: simple-proxy
+    required_headers:
+      - X-Company-ID
+`
+
+	fromYAML, err := LoadConfigFromBytes([]byte(yamlConfig))
+	if err != nil {
+		t.Fatalf("LoadConfigFromBytes() error = %v", err)
+	}
+	fromJSON, err := LoadConfigFromJSONString(jsonConfig)
+	if err != nil {
+		t.Fatalf("LoadConfigFromJSONString() error = %v", err)
+	}
+
+	if !reflect.DeepEqual(fromYAML, fromJSON) {
+		t.Errorf("YAML config = %+v, JSON config = %+v, want them to be equal", fromYAML, fromJSON)
 	}
 }
 

@@ -1,0 +1,13 @@
+{
+  "server": {
+    "port": 8080,
+    "timeout": 60
+  },
+  "routes": [
+    {
+      "path": "/json/*",
+      "target": "https://jsonplaceholder.typicode.com",
+      "methods": ["GET", "POST", "PUT", "DELETE"]
+    }
+  ]
+}
